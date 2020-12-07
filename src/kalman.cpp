@@ -66,5 +66,20 @@ Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double theta, Eigen
  * @return a 2x1 matrix containing the predicted distance and theta for this time step
  */
 Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double theta) {
+    double deltaTheta {-lastRobotTheta + theta};
 
+    // State Extrapolation
+    statePrediction(0,0) = stateUpdated(0,0) - ((deltaX * std::cos(stateUpdated(1,0))) + (deltaY * std::sin(stateUpdated(1,0))));
+    statePrediction(1,0) = stateUpdated(1,0) - deltaTheta;
+
+    // Odometry is our only input information, so we will rely on our state transition
+    stateUpdated = statePrediction;
+
+    // Keep covariance the same. If we re-calculate it, zero error will be detected
+    // since we manually set the prior and posterior estimates to be equal. The EKF will
+    // then decrease covariance sharply and begin trusting its prediction too much.
+
+    lastRobotTheta = theta;
+
+    return stateUpdated;
 }

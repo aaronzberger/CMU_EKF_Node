@@ -24,7 +24,6 @@ constexpr double initialMeasurementErrorInput[2][2] = {{0.25, 0   },
 
 constexpr unsigned maxInitialStateDetections = 5;
 
-
 // Helper Constants
 constexpr uint8_t LEFT = cmu_ekf::line_polar::LEFT;
 constexpr uint8_t CENTER = cmu_ekf::line_polar::CENTER;
@@ -39,12 +38,16 @@ constexpr auto NO_LINE = [&]() {
     return line;
 };
 
+typedef std::pair<cmu_ekf::line_polar, cmu_ekf::line_polar> line_pair;
+
 // Function Prototyes
-bool isLeftOf(cmu_ekf::line_polar s1, cmu_ekf::line_polar s2);
+bool isLeftOf(const cmu_ekf::line_polar s1, const cmu_ekf::line_polar s2);
 void odomCallback(const nav_msgs::Odometry::ConstPtr &msg);
 std::vector<cmu_ekf::line_polar> pointsToPolar(const cmu_unet::line_list::ConstPtr &msg);
-double getYaw(double w, double x, double y, double z);
+line_pair getClosestLines(const std::vector<cmu_ekf::line_polar> lines);
+double getYaw(const double w, const double x, const double y, const double z);
 void lineCallback(const cmu_unet::line_list::ConstPtr &msg);
+bool startKalmanFilters();
 
 double x, y, yaw;
 Kalman filterLeft;
@@ -62,7 +65,7 @@ Eigen::Matrix3d Tglobal_lastFrame;
  * 
  * @return whether s1 is to the left of s2
  */
-bool isLeftOf(cmu_ekf::line_polar s1, cmu_ekf::line_polar s2) {
+bool isLeftOf(const cmu_ekf::line_polar s1, const cmu_ekf::line_polar s2) {
     if ((s1.direction == LEFT && s2.direction == RIGHT) ||
         (s1.direction == CENTER && s2.direction == RIGHT) ||
         (s1.direction == LEFT && s2.direction == CENTER)) return true;
@@ -122,7 +125,7 @@ std::vector<cmu_ekf::line_polar> pointsToPolar(const cmu_unet::line_list::ConstP
  * 
  * @return the yaw calculated
  */
-double getYaw(double w, double x, double y, double z) {
+double getYaw(const double w, const double x, const double y, const double z) {
     tf::Quaternion quat;
     quat.setW(w);
     quat.setX(x);
@@ -139,7 +142,7 @@ double getYaw(double w, double x, double y, double z) {
  * 
  * @return a pair containing a left and right line (either one may be NO_LINE() if it doesn't exist)
  */
-std::pair<cmu_ekf::line_polar, cmu_ekf::line_polar> getClosestLines(const std::vector<cmu_ekf::line_polar> lines) {
+line_pair getClosestLines(const std::vector<cmu_ekf::line_polar> lines) {
     if(lines.size() == 0) {
         return std::make_pair(NO_LINE(), NO_LINE());
     }
@@ -169,7 +172,7 @@ void lineCallback(const cmu_unet::line_list::ConstPtr &msg) {
     std::sort(polarLines.begin(), polarLines.end(), isLeftOf);
     
     // Retrieve the nearest line in either direction for filtering (ignore the rest)
-    std::pair<cmu_ekf::line_polar, cmu_ekf::line_polar> closest {getClosestLines(polarLines)};
+    line_pair closest {getClosestLines(polarLines)};
 
     // Determine the transition model parameters for the EKFs by transforming the frame of reference
     Eigen::Matrix3d Tglobal_thisFrame;
@@ -199,6 +202,77 @@ void lineCallback(const cmu_unet::line_list::ConstPtr &msg) {
     } else {
         outputStateRight = filterRight.filter(deltaX, deltaY, yaw);
     }
+
+    cmu_ekf::lines_org linesMsg;
+
+    cmu_ekf::line_polar left;
+    left.distance = outputStateLeft(0,0);
+    left.theta = outputStateLeft(1,0);
+    left.direction = LEFT;
+
+    cmu_ekf::line_polar right;
+    right.distance = outputStateRight(0,0);
+    right.theta = outputStateRight(1,0);
+    right.direction = RIGHT;
+
+    linesMsg.left = left;
+    linesMsg.right = right;
+    linesMsg.far_left = NO_LINE();
+    linesMsg.far_right = NO_LINE();
+
+    pubLines.publish(linesMsg);
+}
+
+bool startKalmanFilters() {
+    // Gather the filter parameters
+    Eigen::Matrix2d initialCovariance, modelError, measurementError;
+    initialCovariance << initialCovarianceInput[0][0], initialCovarianceInput[0][1],
+                            initialCovarianceInput[1][0], initialCovarianceInput[1][1];
+
+    modelError << initialModelErrorInput[0][0], initialModelErrorInput[0][1],
+                    initialModelErrorInput[1][0], initialModelErrorInput[1][1];
+
+    measurementError << initialMeasurementErrorInput[0][0], initialMeasurementErrorInput[0][1],
+                        initialMeasurementErrorInput[1][0], initialMeasurementErrorInput[1][1];
+
+    // Gather the initial state found by U-Net
+    cmu_unet::line_list::ConstPtr list {ros::topic::waitForMessage<cmu_unet::line_list>("/unet_lines")};
+    
+    // Convert the received lines to polar form
+    std::vector<cmu_ekf::line_polar> polarLines {pointsToPolar(list)};
+
+    // Sort the lines from left to right
+    std::sort(polarLines.begin(), polarLines.end(), isLeftOf);
+
+    // Retrieve the nearest line in either direction
+    line_pair closest {getClosestLines(polarLines)};
+
+    // For the initial state detection, all lines must be present. If they are not, wait for another reading:
+    for (int i{0}; i < maxInitialStateDetections && 
+        (closest.first == NO_LINE() || closest.second == NO_LINE()); i++) {
+        list = ros::topic::waitForMessage<cmu_unet::line_list>("/unet_lines");
+        polarLines = pointsToPolar(list);
+        std::sort(polarLines.begin(), polarLines.end(), isLeftOf);
+        closest = getClosestLines(polarLines);
+    }
+
+    if (closest.first == NO_LINE() || closest.second == NO_LINE()) {
+        std::stringstream ss;
+        ss << "Tried " << maxInitialStateDetections << " times, but only " << ((closest.first == NO_LINE() && closest.second == NO_LINE()) ? 0 : 1) << 
+              " out of 2 required rows were detected. Save an image of the results in the UNet Node to diagnose the problem.";
+        ROS_INFO(ss.str().c_str());
+        return false;
+    }
+
+    // Initialize the Kalman Filters
+    Eigen::MatrixXd left(2, 1), right(2, 1);
+    left << closest.first.distance, closest.first.theta;
+    right << closest.second.distance, closest.second.theta;
+
+    filterLeft = Kalman(x, y, yaw, left, initialCovariance, modelError, measurementError);
+    filterRight = Kalman(x, y, yaw, right, initialCovariance, modelError, measurementError);
+
+    return true;
 }
 
 int main(int argc, char **argv) {
@@ -214,51 +288,7 @@ int main(int argc, char **argv) {
     nav_msgs::Odometry::ConstPtr initialOdom {ros::topic::waitForMessage<nav_msgs::Odometry>("/odometry/filtered")};
     odomCallback(initialOdom);
 
-    // Gather the filter parameters
-    Eigen::Matrix2d initialCovariance, modelError, measurementError;
-    initialCovariance << initialCovarianceInput[0][0], initialCovarianceInput[0][1],
-                            initialCovarianceInput[1][0], initialCovarianceInput[1][1];
-
-    modelError << initialModelErrorInput[0][0], initialModelErrorInput[0][1],
-                    initialModelErrorInput[1][0], initialModelErrorInput[1][1];
-
-    measurementError << initialMeasurementErrorInput[0][0], initialMeasurementErrorInput[0][1],
-                        initialMeasurementErrorInput[1][0], initialMeasurementErrorInput[1][1];
-
-
-    // Gather the initial state found by UNet
-    cmu_unet::line_list::ConstPtr list {ros::topic::waitForMessage<cmu_unet::line_list>("/unet_lines")};
-
-    // For the initial state detection, all lines must be present. If they are not, wait for another reading:
-    for (int i{0}; i < maxInitialStateDetections && list->lines.size() < 2; i++) {
-        list = ros::topic::waitForMessage<cmu_unet::line_list>("/unet_lines");
-    }
-
-    if (list->lines.size() < 2) {
-        std::stringstream ss;
-        ss << "Tried " << maxInitialStateDetections << " times, but only " << list->lines.size() << " out of 2 " <<
-              "required rows were detected. Try saving an image of the results in the UNet Node and see the problem.";
-        ROS_INFO(ss.str().c_str());
-        return 0;
-    }
-
-    std::vector<cmu_ekf::line_polar> polar {pointsToPolar(list)};
-    std::sort(polar.begin(), polar.end(), isLeftOf);
-
-    // Middle represents in-between which lines the robot is
-    std::size_t middle = 0;
-    while(middle < polar.size() - 1 && !(polar.at(middle).direction == LEFT && polar.at(middle + 1).direction == RIGHT)) {
-        middle++;
-    }
-    middle += 0.5;
-
-    // Initialize the Kalman Filters
-    Eigen::MatrixXd left(2, 1), right(2, 1);
-    left << polar.at(middle - 0.5).distance, polar.at(middle - 0.5).theta;
-    right << polar.at(middle + 0.5).distance, polar.at(middle + 0.5).theta;
-
-    filterLeft = Kalman(x, y, yaw, left, initialCovariance, modelError, measurementError);
-    filterRight = Kalman(x, y, yaw, right, initialCovariance, modelError, measurementError);
+    if(!startKalmanFilters()) return -1;
 
     ros::spin();
 
