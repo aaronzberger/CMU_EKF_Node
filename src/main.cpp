@@ -8,10 +8,10 @@
 #include <algorithm>
 #include <utility>
 #include <tuple>
-#include "state.h"
-#include "cmu_unet/line.h"
+#include "cmu_unet/line_2pts.h"
 #include "cmu_unet/line_list.h"
 #include "cmu_ekf/lines_org.h"
+#include "cmu_ekf/line_polar.h"
 #include <sstream>
 
 // USER PARAMETERS
@@ -24,30 +24,35 @@ constexpr double initialMeasurementErrorInput[2][2] = {{0.25, 0   },
 
 constexpr unsigned maxInitialStateDetections = 5;
 
-constexpr bool count4Lines = false;
 
 // Helper Constants
-constexpr state::Direction LEFT = state::Direction::LEFT;
-constexpr state::Direction CENTER = state::Direction::CENTER;
-constexpr state::Direction RIGHT = state::Direction::RIGHT;
+constexpr uint8_t LEFT = cmu_ekf::line_polar::LEFT;
+constexpr uint8_t CENTER = cmu_ekf::line_polar::CENTER;
+constexpr uint8_t RIGHT = cmu_ekf::line_polar::RIGHT;
 
+constexpr auto NO_LINE = [&]() {
+    cmu_ekf::line_polar line;
+    line.distance = 0.0;
+    line.theta = 0.0;
+    // Direction range is [0,2], so 3 is impossible
+    line.direction = 3;
+    return line;
+};
 
 // Function Prototyes
-bool isLeftOf(state s1, state s2);
+bool isLeftOf(cmu_ekf::line_polar s1, cmu_ekf::line_polar s2);
 void odomCallback(const nav_msgs::Odometry::ConstPtr &msg);
-std::vector<state> pointsToPolar(cmu_unet::line_list::ConstPtr &msg);
+std::vector<cmu_ekf::line_polar> pointsToPolar(const cmu_unet::line_list::ConstPtr &msg);
 double getYaw(double w, double x, double y, double z);
 void lineCallback(const cmu_unet::line_list::ConstPtr &msg);
-
 
 double x, y, yaw;
 Kalman filterLeft;
 Kalman filterRight;
-Kalman filterFarLeft;
-Kalman filterFarRight;
 ros::Subscriber subLines;
 ros::Subscriber subOdom;
 ros::Publisher pubLines;
+Eigen::Matrix3d Tglobal_lastFrame;
 
 /**
  * @brief Determines whether a line is to the left of another line
@@ -57,11 +62,13 @@ ros::Publisher pubLines;
  * 
  * @return whether s1 is to the left of s2
  */
-bool isLeftOf(state s1, state s2) {
+bool isLeftOf(cmu_ekf::line_polar s1, cmu_ekf::line_polar s2) {
     if ((s1.direction == LEFT && s2.direction == RIGHT) ||
-        (s1.direction == CENTER && s2.direction == RIGHT)) return true;
+        (s1.direction == CENTER && s2.direction == RIGHT) ||
+        (s1.direction == LEFT && s2.direction == CENTER)) return true;
     if ((s1.direction == RIGHT && s2.direction == LEFT) ||
-        (s1.direction == CENTER && s2.direction == LEFT)) return false;
+        (s1.direction == CENTER && s2.direction == LEFT) ||
+        (s1.direction == RIGHT && s2.direction == CENTER)) return false;
     if (s1.direction == s2.direction == LEFT) return s1.distance > s2.distance;
     else return s1.distance < s2.distance;
 }
@@ -86,14 +93,14 @@ void odomCallback(const nav_msgs::Odometry::ConstPtr &msg) {
  * 
  * @return a vector of states, each containing the polar form of the lines
  */
-std::vector<state> pointsToPolar(cmu_unet::line_list::ConstPtr &msg) {
-    std::vector<state> lines;
+std::vector<cmu_ekf::line_polar> pointsToPolar(const cmu_unet::line_list::ConstPtr &msg) {
+    std::vector<cmu_ekf::line_polar> lines;
     for (int i{0}; i < msg->num_lines; i++) {
         double a {msg->lines[i].y2 - msg->lines[i].y1};
         double b {msg->lines[i].x1 - msg->lines[i].x2};
         double c {-((a * msg->lines[i].x1) + (b * msg->lines[i].y1))};
 
-        state polar;
+        cmu_ekf::line_polar polar;
         polar.distance = std::abs(c) / (std::sqrt(a*a + b*b));
         polar.theta = M_PI_2 + std::atan(-(a / b));
         if (a * c < 0) polar.direction = RIGHT;
@@ -126,11 +133,72 @@ double getYaw(double w, double x, double y, double z) {
 }
 
 /**
- * @brief Receive a line list, differentiate which is which, filter them, and publish
+ * @brief Retrieve the closest rows to the robot from all rows
  * 
- * @TODO Implement this method
+ * @param lines an array of lines (in order)
+ * 
+ * @return a pair containing a left and right line (either one may be NO_LINE() if it doesn't exist)
+ */
+std::pair<cmu_ekf::line_polar, cmu_ekf::line_polar> getClosestLines(const std::vector<cmu_ekf::line_polar> lines) {
+    if(lines.size() == 0) {
+        return std::make_pair(NO_LINE(), NO_LINE());
+    }
+    if(lines.at(0).direction == RIGHT) {
+        return std::make_pair(NO_LINE(), lines.at(0));
+    }
+    if(lines.at(lines.size() - 1).direction == LEFT) {
+        return std::make_pair(lines.at(lines.size() - 1), NO_LINE());
+    }
+    for(int i{1}; i < lines.size(); i++) {
+        if(lines.at(i).direction == RIGHT) {
+            return std::make_pair(lines.at(i-1), lines.at(i));
+        }
+    }
+}
+
+/**
+ * @brief Update the Kalman filters based on the lines received from U-Net
+ * 
+ * @param msg the line_list.msg message from U-Net
  */
 void lineCallback(const cmu_unet::line_list::ConstPtr &msg) {
+    // Convert the received lines to polar form
+    std::vector<cmu_ekf::line_polar> polarLines {pointsToPolar(msg)};
+
+    // Sort the lines from left to right
+    std::sort(polarLines.begin(), polarLines.end(), isLeftOf);
+    
+    // Retrieve the nearest line in either direction for filtering (ignore the rest)
+    std::pair<cmu_ekf::line_polar, cmu_ekf::line_polar> closest {getClosestLines(polarLines)};
+
+    // Determine the transition model parameters for the EKFs by transforming the frame of reference
+    Eigen::Matrix3d Tglobal_thisFrame;
+    Tglobal_thisFrame << std::cos(-yaw), std::sin(-yaw), x,
+                        -std::sin(-yaw), std::cos(-yaw), y,
+                        0              , 0             , 1;
+    
+    Eigen::Matrix3d TlastFrame_thisFrame;
+    TlastFrame_thisFrame = Tglobal_lastFrame.inverse() * Tglobal_thisFrame;
+
+    double deltaX {TlastFrame_thisFrame(0,2)};
+    double deltaY {TlastFrame_thisFrame(1,2)};
+
+    Eigen::MatrixXd outputStateLeft(2, 1), outputStateRight(2, 1);
+
+    if(closest.first != NO_LINE()) {
+        Eigen::MatrixXd state(2, 1);
+        state << closest.first.distance, closest.first.theta;
+        outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw, state);
+    } else {
+        outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw);
+    }
+    if(closest.second != NO_LINE()) {
+        Eigen::MatrixXd state(2, 1);
+        state << closest.second.distance, closest.second.theta;
+        outputStateRight = filterRight.filter(deltaX, deltaY, yaw, state);
+    } else {
+        outputStateRight = filterRight.filter(deltaX, deltaY, yaw);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -162,48 +230,35 @@ int main(int argc, char **argv) {
     cmu_unet::line_list::ConstPtr list {ros::topic::waitForMessage<cmu_unet::line_list>("/unet_lines")};
 
     // For the initial state detection, all lines must be present. If they are not, wait for another reading:
-    for (int i{0}; i < maxInitialStateDetections && list->lines.size() < (count4Lines ? 4 : 2); i++) {
+    for (int i{0}; i < maxInitialStateDetections && list->lines.size() < 2; i++) {
         list = ros::topic::waitForMessage<cmu_unet::line_list>("/unet_lines");
     }
 
-    if (list->lines.size() < (count4Lines ? 4 : 2)) {
+    if (list->lines.size() < 2) {
         std::stringstream ss;
-        ss << "Tried " << maxInitialStateDetections << " times, but only " << list->lines.size() << " out of " << (count4Lines ? 4 : 2) <<
-              " required rows were detected. Try saving an image of the results in the UNet Node (code is already there).";
+        ss << "Tried " << maxInitialStateDetections << " times, but only " << list->lines.size() << " out of 2 " <<
+              "required rows were detected. Try saving an image of the results in the UNet Node and see the problem.";
         ROS_INFO(ss.str().c_str());
         return 0;
     }
 
-    std::vector<state> polar {pointsToPolar(list)};
+    std::vector<cmu_ekf::line_polar> polar {pointsToPolar(list)};
     std::sort(polar.begin(), polar.end(), isLeftOf);
 
     // Middle represents in-between which lines the robot is
     std::size_t middle = 0;
-    while(middle < polar.size() - 1 && !(polar.at(middle).theta < 0 && polar.at(middle + 1).theta > 0)) {
+    while(middle < polar.size() - 1 && !(polar.at(middle).direction == LEFT && polar.at(middle + 1).direction == RIGHT)) {
         middle++;
     }
     middle += 0.5;
 
     // Initialize the Kalman Filters
-    if(!count4Lines) {
-        Eigen::MatrixXd left(2, 1), right(2, 1);
-        left << polar.at(middle - 0.5).distance, polar.at(middle - 0.5).theta;
-        right << polar.at(middle + 0.5).distance, polar.at(middle + 0.5).theta;
+    Eigen::MatrixXd left(2, 1), right(2, 1);
+    left << polar.at(middle - 0.5).distance, polar.at(middle - 0.5).theta;
+    right << polar.at(middle + 0.5).distance, polar.at(middle + 0.5).theta;
 
-        filterLeft = Kalman(x, y, yaw, left, initialCovariance, modelError, measurementError);
-        filterRight = Kalman(x, y, yaw, right, initialCovariance, modelError, measurementError);
-    } else {
-        Eigen::MatrixXd farLeft(2, 1), left(2, 1), right(2, 1), farRight(2, 1);
-        farLeft << polar.at(middle - 1.5).distance, polar.at(middle - 1.5).theta;
-        left << polar.at(middle - 0.5).distance, polar.at(middle - 0.5).theta;
-        right << polar.at(middle + 0.5).distance, polar.at(middle + 0.5).theta;
-        farRight << polar.at(middle + 1.5).distance, polar.at(middle + 1.5).theta;
-
-        filterFarLeft = Kalman(x, y, yaw, farLeft, initialCovariance, modelError, measurementError);
-        filterLeft = Kalman(x, y, yaw, left, initialCovariance, modelError, measurementError);
-        filterRight = Kalman(x, y, yaw, right, initialCovariance, modelError, measurementError);
-        filterFarRight = Kalman(x, y, yaw, farRight, initialCovariance, modelError, measurementError);
-    }
+    filterLeft = Kalman(x, y, yaw, left, initialCovariance, modelError, measurementError);
+    filterRight = Kalman(x, y, yaw, right, initialCovariance, modelError, measurementError);
 
     ros::spin();
 
