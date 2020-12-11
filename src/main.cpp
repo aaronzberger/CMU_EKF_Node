@@ -13,14 +13,17 @@
 #include "cmu_ekf/lines_org.h"
 #include "cmu_ekf/line_polar.h"
 #include <sstream>
+#include <iostream>
+#include <fstream>
+#include <string>
 
 // USER PARAMETERS
 constexpr double initialCovarianceInput[2][2] = {{0.3, 0  },
                                                  {0  , 0.3}};
-constexpr double initialModelErrorInput[2][2] = {{0.02, 0},
-                                                 {0, 0.02}};
-constexpr double initialMeasurementErrorInput[2][2] = {{0.25, 0   },
-                                                       {0   , 0.25}};
+constexpr double initialModelErrorInput[2][2] = {{0.01, 0},
+                                                 {0, 0.01}};
+constexpr double initialMeasurementErrorInput[2][2] = {{0.3, 0   },
+                                                       {0  , 0.3}};
 
 constexpr unsigned maxInitialStateDetections = 5;
 
@@ -28,6 +31,9 @@ constexpr unsigned maxInitialStateDetections = 5;
 constexpr uint8_t LEFT = cmu_ekf::line_polar::LEFT;
 constexpr uint8_t CENTER = cmu_ekf::line_polar::CENTER;
 constexpr uint8_t RIGHT = cmu_ekf::line_polar::RIGHT;
+
+constexpr char lineTopic[] = "/ransac_lines";
+constexpr char odomTopic[] = "/odometry/filtered";
 
 constexpr auto NO_LINE = [&]() {
     cmu_ekf::line_polar line;
@@ -49,13 +55,20 @@ double getYaw(const double w, const double x, const double y, const double z);
 void lineCallback(const cmu_unet::line_list::ConstPtr &msg);
 bool startKalmanFilters();
 
+// Robot odometry
 double x, y, yaw;
+
 Kalman filterLeft;
 Kalman filterRight;
-ros::Subscriber subLines;
-ros::Subscriber subOdom;
+
 ros::Publisher pubLines;
+
+// Last reference frame for obtaining deltaX and deltaY each time step
 Eigen::Matrix3d Tglobal_lastFrame;
+
+// For graphing EKF results
+std::ofstream ekfGraphing;
+int graphCounter;
 
 /**
  * @brief Determines whether a line is to the left of another line
@@ -99,13 +112,33 @@ void odomCallback(const nav_msgs::Odometry::ConstPtr &msg) {
 std::vector<cmu_ekf::line_polar> pointsToPolar(const cmu_unet::line_list::ConstPtr &msg) {
     std::vector<cmu_ekf::line_polar> lines;
     for (int i{0}; i < msg->num_lines; i++) {
-        double a {msg->lines[i].y2 - msg->lines[i].y1};
-        double b {msg->lines[i].x1 - msg->lines[i].x2};
-        double c {-((a * msg->lines[i].x1) + (b * msg->lines[i].y1))};
+        double x1 {msg->lines[i].x1};
+        double y1 {msg->lines[i].y1};
+        double x2 {msg->lines[i].x2};
+        double y2 {msg->lines[i].y2};
+
+        double dx {x2 - x1};
+        double dy {y2 - y1};
+        double det {(dx*dx) + (dy*dy)};
+        double num {((dy * -y1) + (dx * -x1)) / det};
+
+        double closestX {x1 + (num * dx)};
+        double closestY {y1 + (num * dy)};
+
+        double a {dy};
+        double b {-dx};
+        double c {(a * x1) + (b * y1)};
 
         cmu_ekf::line_polar polar;
+
+        // Derived from abs(a*x + b*y + c) / sqrt(a*a + b*b), but since we're measuring from
+        // the robot, x and y = 0, so it simplifies.
         polar.distance = std::abs(c) / (std::sqrt(a*a + b*b));
-        polar.theta = M_PI_2 + std::atan(-(a / b));
+
+        // Subtract from PI/2 so that straight ahead is 90deg and theta decreases as the robot
+        // points towards the row
+        polar.theta = M_PI_2 - std::atan2(closestY, closestX);
+        
         if (a * c < 0) polar.direction = RIGHT;
         else if (a * c > 0) polar.direction = LEFT;
         else polar.direction = CENTER;
@@ -170,7 +203,7 @@ void lineCallback(const cmu_unet::line_list::ConstPtr &msg) {
 
     // Sort the lines from left to right
     std::sort(polarLines.begin(), polarLines.end(), isLeftOf);
-    
+
     // Retrieve the nearest line in either direction for filtering (ignore the rest)
     line_pair closest {getClosestLines(polarLines)};
 
@@ -186,6 +219,9 @@ void lineCallback(const cmu_unet::line_list::ConstPtr &msg) {
     double deltaX {TlastFrame_thisFrame(0,2)};
     double deltaY {TlastFrame_thisFrame(1,2)};
 
+    Tglobal_lastFrame = Tglobal_thisFrame;
+
+    // Set the output state for the two rows by updating the EKF for each
     Eigen::MatrixXd outputStateLeft(2, 1), outputStateRight(2, 1);
 
     if(closest.first != NO_LINE()) {
@@ -193,6 +229,7 @@ void lineCallback(const cmu_unet::line_list::ConstPtr &msg) {
         state << closest.first.distance, closest.first.theta;
         outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw, state);
     } else {
+        ROS_INFO("No line on the left found, time update only");
         outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw);
     }
     if(closest.second != NO_LINE()) {
@@ -200,9 +237,11 @@ void lineCallback(const cmu_unet::line_list::ConstPtr &msg) {
         state << closest.second.distance, closest.second.theta;
         outputStateRight = filterRight.filter(deltaX, deltaY, yaw, state);
     } else {
+        ROS_INFO("No line on the right found, time update only");
         outputStateRight = filterRight.filter(deltaX, deltaY, yaw);
     }
 
+    // Publish the message containing these two rows
     cmu_ekf::lines_org linesMsg;
 
     cmu_ekf::line_polar left;
@@ -221,9 +260,23 @@ void lineCallback(const cmu_unet::line_list::ConstPtr &msg) {
     linesMsg.far_right = NO_LINE();
 
     pubLines.publish(linesMsg);
+
+    // Save the original lines and smoothed lines to a csv file for graphing
+    ekfGraphing << graphCounter << "," << closest.first.distance << "," << closest.first.theta << 
+    "," << outputStateLeft(0,0) << "," << outputStateLeft(1,0) << "\n";
+    graphCounter++;
 }
 
+/**
+ * @brief Start or restart the EKFs for the left and right rows
+ * 
+ * @return whether both filters were successfully setup. If they weren't it is due to insufficient state detection.
+ */
 bool startKalmanFilters() {
+    Tglobal_lastFrame << std::cos(-yaw), std::sin(-yaw), x,
+                        -std::sin(-yaw), std::cos(-yaw), y,
+                        0              , 0             , 1;
+
     // Gather the filter parameters
     Eigen::Matrix2d initialCovariance, modelError, measurementError;
     initialCovariance << initialCovarianceInput[0][0], initialCovarianceInput[0][1],
@@ -236,7 +289,7 @@ bool startKalmanFilters() {
                         initialMeasurementErrorInput[1][0], initialMeasurementErrorInput[1][1];
 
     // Gather the initial state found by U-Net
-    cmu_unet::line_list::ConstPtr list {ros::topic::waitForMessage<cmu_unet::line_list>("/unet_lines")};
+    cmu_unet::line_list::ConstPtr list {ros::topic::waitForMessage<cmu_unet::line_list>(lineTopic)};
     
     // Convert the received lines to polar form
     std::vector<cmu_ekf::line_polar> polarLines {pointsToPolar(list)};
@@ -250,7 +303,7 @@ bool startKalmanFilters() {
     // For the initial state detection, all lines must be present. If they are not, wait for another reading:
     for (int i{0}; i < maxInitialStateDetections && 
         (closest.first == NO_LINE() || closest.second == NO_LINE()); i++) {
-        list = ros::topic::waitForMessage<cmu_unet::line_list>("/unet_lines");
+        list = ros::topic::waitForMessage<cmu_unet::line_list>(lineTopic);
         polarLines = pointsToPolar(list);
         std::sort(polarLines.begin(), polarLines.end(), isLeftOf);
         closest = getClosestLines(polarLines);
@@ -263,11 +316,19 @@ bool startKalmanFilters() {
         ROS_INFO(ss.str().c_str());
         return false;
     }
+    
+    ROS_INFO("Collected initial state detection");
 
     // Initialize the Kalman Filters
     Eigen::MatrixXd left(2, 1), right(2, 1);
     left << closest.first.distance, closest.first.theta;
     right << closest.second.distance, closest.second.theta;
+
+    // Gather the initial odometry
+    // This must be after waiting for the lines to publish, in case the robot moves during that time (it wouldn't be tracked)
+    nav_msgs::Odometry::ConstPtr initialOdom {ros::topic::waitForMessage<nav_msgs::Odometry>(odomTopic)};
+    odomCallback(initialOdom);
+    ROS_INFO("Gathered initial robot odometry");
 
     filterLeft = Kalman(x, y, yaw, left, initialCovariance, modelError, measurementError);
     filterRight = Kalman(x, y, yaw, right, initialCovariance, modelError, measurementError);
@@ -280,17 +341,18 @@ int main(int argc, char **argv) {
 
     ros::NodeHandle n;
 
-    subLines = n.subscribe<cmu_unet::line_list>("/unet_lines", 1, lineCallback);
-    subOdom = n.subscribe<nav_msgs::Odometry>("/odometry/filtered", 1, odomCallback);
+    ros::Subscriber subLines = n.subscribe<cmu_unet::line_list>(lineTopic, 1, lineCallback);
+    ros::Subscriber subOdom = n.subscribe<nav_msgs::Odometry>(odomTopic, 1, odomCallback);
     pubLines = n.advertise<cmu_ekf::lines_org>("/ekf_lines", 1);
 
-    // Gather the initial odometry
-    nav_msgs::Odometry::ConstPtr initialOdom {ros::topic::waitForMessage<nav_msgs::Odometry>("/odometry/filtered")};
-    odomCallback(initialOdom);
+    // For graphing EKF results
+    ekfGraphing = std::ofstream("ekf_graphing.csv");
+    graphCounter = 0;
 
     if(!startKalmanFilters()) return -1;
 
     ros::spin();
 
+    ekfGraphing.close();
     return 0;
 }
