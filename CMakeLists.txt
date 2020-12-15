@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0.2)
-project(cmu_ekf)
+project(CMU_EKF_Node)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
 # add_compile_options(-std=c++11)
@@ -11,8 +11,9 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   message_generation
   std_msgs
-  PCL REQUIRED
-  cmu_unet
+  pcl_conversions
+  pcl_ros
+  CMU_UNet_Node
 )
 
 ## System dependencies are found with CMake's conventions
@@ -73,7 +74,7 @@ add_message_files(
 generate_messages(
   DEPENDENCIES
   std_msgs  # Or other packages containing msgs
-  cmu_unet
+  CMU_UNet_Node
 )
 
 ################################################
@@ -107,8 +108,8 @@ generate_messages(
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
 #  INCLUDE_DIRS include
-#  LIBRARIES cmu_ekf
-  CATKIN_DEPENDS roscpp message_runtime cmu_unet
+#  LIBRARIES CMU_EKF_Node
+  CATKIN_DEPENDS roscpp message_runtime CMU_UNet_Node
 #  DEPENDS system_lib
 )
 
@@ -121,7 +122,6 @@ catkin_package(
 include_directories(
 # include
   ${catkin_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
 )
 
 ## Declare a C++ library
@@ -210,5 +210,5 @@ include_directories(
 # catkin_add_nosetests(test)
 
 add_executable(ekf src/main.cpp)
-target_link_libraries(ekf ${catkin_LIBRARIES} ${PCL_LIBRARIES})
+target_link_libraries(ekf ${catkin_LIBRARIES})
 add_dependencies(ekf ${catkin_EXPORTED_TARGETS})

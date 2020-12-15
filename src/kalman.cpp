@@ -3,11 +3,10 @@
 #include <Eigen/Dense>
 #include <cmath>
 
-Kalman::Kalman(double x, double y, double theta, Eigen::MatrixXd initialState,
+Kalman::Kalman(Eigen::MatrixXd initialState,
                Eigen::Matrix2d covInitial, Eigen::Matrix2d modelError, 
                Eigen::Matrix2d measurementError, Eigen::Matrix2d observationTransform) 
-    :lastRobotX{x}, lastRobotY{y}, lastRobotTheta{theta}, 
-    initialCovariance{initialCovariance}, observationTransform{observationTransform} {
+    :initialCovariance{initialCovariance}, observationTransform{observationTransform} {
     setModelError(modelError);
     setMeasurementError(measurementError);
 
@@ -22,14 +21,12 @@ Kalman::Kalman(double x, double y, double theta, Eigen::MatrixXd initialState,
  * 
  * @param deltaX change in X since last update (in the last update's reference frame)
  * @param deltaY change in Y since last update (in the last update's reference frame)
- * @param theta the yaw of the robot (not delta)
+ * @param deltaTheta change in yaw of the robot
  * @param detectedState a 2x1 matrix containing distance and theta
  * 
  * @return a 2x1 matrix containing the filtered distance and theta
  */
-Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double theta, Eigen::MatrixXd detectedState) {
-    double deltaTheta {-lastRobotTheta + theta};
-
+Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double deltaTheta, Eigen::MatrixXd detectedState) {
     // State Extrapolation
     statePrediction(0,0) = stateUpdated(0,0) - ((deltaX * std::cos(stateUpdated(1,0))) + (deltaY * std::sin(stateUpdated(1,0))));
     statePrediction(1,0) = stateUpdated(1,0) - deltaTheta;
@@ -51,8 +48,6 @@ Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double theta, Eigen
     // Covariance Update
     covUpdated = (Eigen::Matrix2d::Identity() - (kGain * observationTransform)) * covPrediction;
 
-    lastRobotTheta = theta;
-
     return stateUpdated;
 }
 
@@ -61,13 +56,11 @@ Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double theta, Eigen
  * 
  * @param deltaX change in X since last update (in the last update's reference frame)
  * @param deltaY change in Y since last update (in the last update's reference frame)
- * @param theta the yaw of the robot (not delta)
+ * @param deltaTheta change in yaw of the robot
  * 
  * @return a 2x1 matrix containing the predicted distance and theta for this time step
  */
-Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double theta) {
-    double deltaTheta {-lastRobotTheta + theta};
-
+Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double deltaTheta) {
     // State Extrapolation
     statePrediction(0,0) = stateUpdated(0,0) - ((deltaX * std::cos(stateUpdated(1,0))) + (deltaY * std::sin(stateUpdated(1,0))));
     statePrediction(1,0) = stateUpdated(1,0) - deltaTheta;
@@ -78,8 +71,6 @@ Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double theta) {
     // Keep covariance the same. If we re-calculate it, zero error will be detected
     // since we manually set the prior and posterior estimates to be equal. The EKF will
     // then decrease covariance sharply and begin trusting its prediction too much.
-
-    lastRobotTheta = theta;
 
     return stateUpdated;
 }

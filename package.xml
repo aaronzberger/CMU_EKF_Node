@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>cmu_ekf</name>
+  <name>CMU_EKF_Node</name>
   <version>0.0.0</version>
   <description>The cmu_ekf package</description>
 
@@ -50,13 +50,19 @@
   <!--   <doc_depend>doxygen</doc_depend> -->
   <buildtool_depend>catkin</buildtool_depend>
   <build_depend>roscpp</build_depend>
-  <build_depend>cmu_unet</build_depend>
+  <build_depend>CMU_UNet_Node</build_depend>
   <build_depend>message_generation</build_depend>
+  <build_depend>libpcl-all-dev</build_depend>
+  <build_depend>pcl_conversions</build_depend>
+  <build_depend>pcl_ros</build_depend>
 
   <build_export_depend>roscpp</build_export_depend>
   <exec_depend>roscpp</exec_depend>
   <exec_depend>message_runtime</exec_depend>
-  <exec_depend>cmu_unet</exec_depend>
+  <exec_depend>CMU_UNet_Node</exec_depend>
+  <exec_depend>libpcl-all</exec_depend>
+  <exec_depend>pcl_conversions</exec_depend>
+  <exec_depend>pcl_ros</exec_depend>
 
 
   <!-- The export tag contains other, unspecified, tags -->
