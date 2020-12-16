@@ -20,6 +20,9 @@
 // USER PARAMETERS
 constexpr double initialCovarianceInput[2][2] = {{0.3, 0  },
                                                  {0  , 0.3}};
+                                                 
+// 12/16/20 : Temporarily setting model error to 0 while UNet is undertrained,
+// so I can work on path planning with consistent measurements.
 constexpr double initialModelErrorInput[2][2] = {{0.0, 0},
                                                  {0, 0.0}};
 constexpr double initialMeasurementErrorInput[2][2] = {{0.3, 0   },
@@ -65,7 +68,7 @@ ros::Publisher pubLines;
 
 // Last reference frame for obtaining deltaX and deltaY each time step
 Eigen::Matrix3d Tglobal_lastFrame;
-double lastTheta;
+double lastYaw;
 
 // For graphing EKF results
 std::ofstream ekfGraphing;
@@ -137,8 +140,8 @@ std::vector<CMU_EKF_Node::line_polar> pointsToPolar(const CMU_UNet_Node::line_li
         // because it would give us the distance to a point on the line that may be ahead or behind the robot
         polar.distance = std::abs(c / b);
 
-        // Subtract from PI/2 so that straight ahead is 90deg and theta decreases as the robot
-        // points towards the row
+        // Ignore the direction of the robot. PI/2 is parallel to the line,
+        // and theta decreases as the robot turns towards the line (in either direction)
         polar.theta = std::abs(std::atan2(closestY, closestX));
         
         if (c / b > 0) polar.direction = RIGHT;
@@ -229,21 +232,22 @@ void lineCallback(const CMU_UNet_Node::line_list::ConstPtr &msg) {
     if(closest.first != NO_LINE()) {
         Eigen::MatrixXd state(2, 1);
         state << closest.first.distance, closest.first.theta;
-        outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw - lastTheta, state);
+        outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw - lastYaw, state);
     } else {
         ROS_INFO("No line on the left found, time update only");
-        outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw - lastTheta);
+        outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw - lastYaw);
     }
     if(closest.second != NO_LINE()) {
         Eigen::MatrixXd state(2, 1);
         state << closest.second.distance, closest.second.theta;
-        outputStateRight = filterRight.filter(deltaX, deltaY, lastTheta - yaw, state);
+        // Reverse deltaYaw so the direction is mirrored for rows on both sides
+        outputStateRight = filterRight.filter(deltaX, deltaY, lastYaw - yaw, state);
     } else {
         ROS_INFO("No line on the right found, time update only");
-        outputStateRight = filterRight.filter(deltaX, deltaY, lastTheta - yaw);
+        outputStateRight = filterRight.filter(deltaX, deltaY, lastYaw - yaw);
     }
 
-    lastTheta = yaw;
+    lastYaw = yaw;
 
     // Publish the message containing these two rows
     CMU_EKF_Node::lines_org linesMsg;
@@ -266,8 +270,8 @@ void lineCallback(const CMU_UNet_Node::line_list::ConstPtr &msg) {
     pubLines.publish(linesMsg);
 
     // Save the original lines and smoothed lines to a csv file for graphing
-    ekfGraphing << graphCounter << "," << closest.second.distance << "," << closest.second.theta << 
-    "," << outputStateRight(0,0) << "," << outputStateRight(1,0) << "\n";
+    ekfGraphing << graphCounter << "," << closest.first.distance << "," << closest.first.theta << 
+    "," << outputStateLeft(0,0) << "," << outputStateLeft(1,0) << "\n";
     graphCounter++;
 }
 
@@ -277,10 +281,6 @@ void lineCallback(const CMU_UNet_Node::line_list::ConstPtr &msg) {
  * @return whether both filters were successfully setup. If they weren't it is due to insufficient state detection.
  */
 bool startKalmanFilters() {
-    Tglobal_lastFrame << std::cos(-yaw), std::sin(-yaw), x,
-                        -std::sin(-yaw), std::cos(-yaw), y,
-                        0              , 0             , 1;
-
     // Gather the filter parameters
     Eigen::Matrix2d initialCovariance, modelError, measurementError;
     initialCovariance << initialCovarianceInput[0][0], initialCovarianceInput[0][1],
@@ -322,6 +322,7 @@ bool startKalmanFilters() {
     }
     
     ROS_INFO("Collected initial state detection");
+    std::cout << closest.second.distance << " " << closest.second.theta << std::endl;
 
     // Initialize the Kalman Filters
     Eigen::MatrixXd left(2, 1), right(2, 1);
@@ -329,16 +330,25 @@ bool startKalmanFilters() {
     right << closest.second.distance, closest.second.theta;
 
     // Gather the initial odometry
-    // This must be after waiting for the lines to publish, in case the robot moves during that time (it wouldn't be tracked)
+    // This must be after waiting for the lines to publish, 
+    // in case the robot moves during that time (which wouldn't be tracked)
     nav_msgs::Odometry::ConstPtr initialOdom {ros::topic::waitForMessage<nav_msgs::Odometry>(odomTopic)};
     odomCallback(initialOdom);
     
     ROS_INFO("Gathered initial robot odometry");
 
+    std::cout << "initialize left EKF" << std::endl;
     filterLeft = Kalman(left, initialCovariance, modelError, measurementError);
+    std::cout << "initialize right EKF" << std::endl;
     filterRight = Kalman(right, initialCovariance, modelError, measurementError);
 
-    lastTheta = yaw;
+    lastYaw = yaw;
+
+    // Set an initial frame of reference: must be done after gathering initial odometry,
+    // or else x, y, and yaw will be default 0 and the delta values will be wrong on first loop.
+    Tglobal_lastFrame << std::cos(-yaw), std::sin(-yaw), x,
+                        -std::sin(-yaw), std::cos(-yaw), y,
+                        0              , 0             , 1;
 
     return true;
 }

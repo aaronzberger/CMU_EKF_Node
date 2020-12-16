@@ -21,15 +21,15 @@ Kalman::Kalman(Eigen::MatrixXd initialState,
  * 
  * @param deltaX change in X since last update (in the last update's reference frame)
  * @param deltaY change in Y since last update (in the last update's reference frame)
- * @param deltaTheta change in yaw of the robot
+ * @param deltaYaw change in yaw since last update
  * @param detectedState a 2x1 matrix containing distance and theta
  * 
  * @return a 2x1 matrix containing the filtered distance and theta
  */
-Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double deltaTheta, Eigen::MatrixXd detectedState) {
+Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double deltaYaw, Eigen::MatrixXd detectedState) {
     // State Extrapolation
     statePrediction(0,0) = stateUpdated(0,0) - ((deltaX * std::cos(stateUpdated(1,0))) + (deltaY * std::sin(stateUpdated(1,0))));
-    statePrediction(1,0) = stateUpdated(1,0) - deltaTheta;
+    statePrediction(1,0) = stateUpdated(1,0) - deltaYaw;
 
     // Covariance Extrapolation
     Eigen::Matrix2d jacobian;
@@ -56,14 +56,14 @@ Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double deltaTheta, 
  * 
  * @param deltaX change in X since last update (in the last update's reference frame)
  * @param deltaY change in Y since last update (in the last update's reference frame)
- * @param deltaTheta change in yaw of the robot
+ * @param deltaYaw change in yaw since last update
  * 
  * @return a 2x1 matrix containing the predicted distance and theta for this time step
  */
-Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double deltaTheta) {
+Eigen::MatrixXd Kalman::filter(double deltaX, double deltaY, double deltaYaw) {
     // State Extrapolation
     statePrediction(0,0) = stateUpdated(0,0) - ((deltaX * std::cos(stateUpdated(1,0))) + (deltaY * std::sin(stateUpdated(1,0))));
-    statePrediction(1,0) = stateUpdated(1,0) - deltaTheta;
+    statePrediction(1,0) = stateUpdated(1,0) - deltaYaw;
 
     // Odometry is our only input information, so we will rely on our state transition
     stateUpdated = statePrediction;
