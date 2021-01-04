@@ -49,7 +49,7 @@ If the robot is parallel to the row, theta will be 90 degrees. As the robot turn
 #### State Transition Matrix
 The State Transition Matrix/Model is how the Extended Kalman Filter extrapolates the estimate for the current state (this is the 'prior' estimate).
 
-![State Transition Matrix](https://user-images.githubusercontent.com/35245591/102545090-c2eae700-4083-11eb-852e-809eb42c4a19.png)
+![State Transition Matrix](https://user-images.githubusercontent.com/35245591/103568173-1be3b900-4e93-11eb-81a5-bbc53120d044.png)
 
 In this case, we are tracking static objects, so the model should be perfect except for inaccuracies in odometry caused by drifting.
 
