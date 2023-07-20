@@ -17,6 +17,7 @@
 #include <fstream>
 #include <string>
 
+
 // USER PARAMETERS
 constexpr double initialCovarianceInput[2][2] = {{0.3, 0  },
                                                  {0  , 0.3}};
@@ -31,7 +32,7 @@ constexpr double initialMeasurementErrorInput[2][2] = {{0.3, 0   },
 constexpr unsigned maxInitialStateDetections = 5;
 
 constexpr double ROW_SPACING = 1;
-constexpr bool MIDDLE_ROW = true;
+constexpr bool MIDDLE_ROW = false;
 
 // Helper Constants
 constexpr uint8_t LEFT = CMU_EKF_Node::line_polar::LEFT;
@@ -40,6 +41,8 @@ constexpr uint8_t RIGHT = CMU_EKF_Node::line_polar::RIGHT;
 
 constexpr char lineTopic[] = "/lines";
 constexpr char odomTopic[] = "/odometry/filtered";
+
+constexpr bool VERBOSE = false;
 
 /**
  * @brief A line_polar with all values set to 0
@@ -67,7 +70,6 @@ double x, y, yaw;
 
 // TODO: Replace this with a list of filters, to allow for variable number of lines
 Kalman filterLeft;
-Kalman filterCenter;
 Kalman filterRight;
 
 ros::Publisher pubLines;
@@ -145,12 +147,12 @@ std::vector<CMU_EKF_Node::line_polar> pointsToPolar(const CMU_UNet_Node::line_li
         // because it would give us the distance to a point on the line that may be ahead or behind the robot
         polar.distance = std::abs(c / b);
 
-        // Ignore the direction of the robot. PI/2 is parallel to the line,
-        // and theta decreases as the robot turns towards the line (in either direction)
-        polar.theta = std::abs(std::atan2(closestY, closestX));
-        
-        if (c / b > 0) polar.direction = RIGHT;
-        else if (c / b < 0) polar.direction = LEFT;
+        // Theta should be between -pi and pi (negative is left)
+        // Theta needs to be reversed, since for y, left is positive and thus would be positive theta
+        polar.theta = -std::atan2(closestY, closestX);
+
+        if (polar.theta < 0) polar.direction = LEFT;
+        else if (polar.theta > 0) polar.direction = RIGHT;
         else polar.direction = CENTER;
 
         lines.push_back(polar);
@@ -180,21 +182,17 @@ double getYaw(const double w, const double x, const double y, const double z) {
     return tf::getYaw(quat);
 }
 
-CMU_EKF_Node::lines_org organizeLines(const std::vector<CMU_EKF_Node::line_polar> lines) {
+CMU_EKF_Node::lines_org organizeLines(const std::vector<CMU_EKF_Node::line_polar> lines, const double spots[4]) {
     CMU_EKF_Node::lines_org organized;
     
     // Twice through all spots: take the closest line, unless it's closer to another
     // unassigned spot, or its further than another assigned line
 
-    double spots[5] = {-ROW_SPACING * 2, -ROW_SPACING, 0, ROW_SPACING, ROW_SPACING * 2};
-    int assigned[5] = {-1, -1, -1, -1, -1};
+    int assigned[4] = {-1, -1, -1, -1};
 
     // Do this process twice
     for (int k{0}; k < 2; k++) {
-        for (int i{0}; i < 5; i++) {
-            // Don't assign the middle row if it doesn't exist
-            if (!MIDDLE_ROW && i == 2) continue;
-
+        for (int i{0}; i < 4; i++) {
             // Don't assign a spot that's already assigned
             if (assigned[i] != -1) continue;
 
@@ -214,7 +212,7 @@ CMU_EKF_Node::lines_org organizeLines(const std::vector<CMU_EKF_Node::line_polar
             double linePosition {lines.at(closestLineIndex).distance * (lines.at(closestLineIndex).direction == RIGHT ? 1 : -1)};
             double closestSpotDist{1000};
             int closestSpotIndex{-1};
-            for (int j{0}; j < 5; j++) {
+            for (int j{0}; j < 4; j++) {
                 double dist = std::abs(spots[j] - linePosition);
                 if (dist < closestSpotDist) {
                     closestSpotDist = dist;
@@ -232,9 +230,8 @@ CMU_EKF_Node::lines_org organizeLines(const std::vector<CMU_EKF_Node::line_polar
     // Assign the lines to the output
     if (assigned[0] != -1) organized.far_left = lines.at(assigned[0]);
     if (assigned[1] != -1) organized.left = lines.at(assigned[1]);
-    if (assigned[2] != -1) organized.center = lines.at(assigned[2]);
-    if (assigned[3] != -1) organized.right = lines.at(assigned[3]);
-    if (assigned[4] != -1) organized.far_right = lines.at(assigned[4]);
+    if (assigned[2] != -1) organized.right = lines.at(assigned[2]);
+    if (assigned[3] != -1) organized.far_right = lines.at(assigned[3]);
 
     return organized;
 }
@@ -245,12 +242,12 @@ CMU_EKF_Node::lines_org organizeLines(const std::vector<CMU_EKF_Node::line_polar
  * @param msg the line_list.msg message from U-Net
  */
 void lineCallback(const CMU_UNet_Node::line_list::ConstPtr &msg) {
+    if (VERBOSE) ROS_INFO("Received lines");
+
     // Convert the received lines to polar form
     std::vector<CMU_EKF_Node::line_polar> polarLines {pointsToPolar(msg)};
 
-    // TODO: Optimally, in the first frame the positions of all lines are decided and from then on,
-    // lines are matched with the filter they are closest to (by prediction, perhaps with a small weighting
-    // towards what makes sense for the current frame). For now, they're decided each frame, then inserted.
+    if (VERBOSE) ROS_INFO("Converted lines to polar");
 
     // Determine the transition model parameters for the EKFs by transforming the frame of reference
     Eigen::Matrix3d Tglobal_thisFrame;
@@ -263,42 +260,46 @@ void lineCallback(const CMU_UNet_Node::line_list::ConstPtr &msg) {
 
     double deltaX {TlastFrame_thisFrame(0,2)};
     double deltaY {TlastFrame_thisFrame(1,2)};
+    double deltaYaw {lastYaw - yaw};
+
+    // std::cout << "deltaYaw: " << deltaYaw << " deltaY: " << deltaY << " deltaX: " << deltaX << std::endl;
 
     Tglobal_lastFrame = Tglobal_thisFrame;
 
     // Get predictions for all the filters
-    Eigen::MatrixXd predictionLeft = filterLeft.predictionUpdate(deltaX, deltaY, yaw - lastYaw);
-    Eigen::MatrixXd predictionCenter = filterCenter.predictionUpdate(deltaX, deltaY, yaw - lastYaw);
-    Eigen::MatrixXd predictionRight = filterRight.predictionUpdate(deltaX, deltaY, yaw - lastYaw);
+    Eigen::MatrixXd predictionLeft = filterLeft.predictionUpdate(deltaX, deltaY, deltaYaw);
+    Eigen::MatrixXd predictionRight = filterRight.predictionUpdate(deltaX, deltaY, deltaYaw);
+
+    if (VERBOSE) ROS_INFO("Performed prediction update");
 
     // Set the output state for the two rows by updating the EKF for each
     Eigen::MatrixXd outputStateLeft(2, 1), outputStateRight(2, 1);
 
+    double linePredictions[4] = {-20, -predictionLeft(0, 0), predictionRight(0, 0), 20};
+
     // Match each line to the closest filter prediction (by distance)
+    CMU_EKF_Node::lines_org organized = organizeLines(polarLines, linePredictions);
 
+    if (VERBOSE) ROS_INFO("Organized lines");
 
-    if(closest.first != NO_LINE()) {
+    if (organized.left != NO_LINE()) {
         Eigen::MatrixXd state(2, 1);
-        state << closest.first.distance, closest.first.theta;
-        // std::cout << "Start left update" << std::endl;
-        outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw - lastYaw, state);
-        // std::cout << "End left update" << outputStateLeft << std::endl;
+        state << organized.left.distance, organized.left.theta;
+        outputStateLeft = filterLeft.measurementUpdate(deltaX, deltaY, state);
     } else {
         ROS_INFO("No line on the left found, time update only");
-        outputStateLeft = filterLeft.filter(deltaX, deltaY, yaw - lastYaw);
+        outputStateLeft = filterLeft.timeUpdate(deltaX, deltaY, deltaYaw);
     }
-    if(closest.second != NO_LINE()) {
+    if (organized.right != NO_LINE()) {
         Eigen::MatrixXd state(2, 1);
-        state << closest.second.distance, closest.second.theta;
-        // Reverse deltaYaw so the direction is mirrored for rows on both sides
-        outputStateRight = filterRight.filter(deltaX, deltaY, lastYaw - yaw, state);
+        state << organized.right.distance, organized.right.theta;
+        outputStateRight = filterRight.measurementUpdate(deltaX, deltaY, state);
     } else {
         ROS_INFO("No line on the right found, time update only");
-        outputStateRight = filterRight.filter(deltaX, deltaY, lastYaw - yaw);
+        outputStateRight = filterRight.timeUpdate(deltaX, deltaY, deltaYaw);
     }
 
-    // std::cout << "Left: " << outputStateLeft << std::endl;
-    // std::cout << "Right: " << outputStateRight << std::endl;
+    if (VERBOSE) ROS_INFO("Performed measurement update");
 
     lastYaw = yaw;
 
@@ -323,7 +324,7 @@ void lineCallback(const CMU_UNet_Node::line_list::ConstPtr &msg) {
     pubLines.publish(linesMsg);
 
     // Save the original lines and smoothed lines to a csv file for graphing
-    ekfGraphing << graphCounter << "," << closest.first.distance << "," << closest.first.theta << 
+    ekfGraphing << graphCounter << "," << left.distance << "," << left.theta << 
     "," << outputStateLeft(0,0) << "," << outputStateLeft(1,0) << "\n";
     graphCounter++;
 }
@@ -351,36 +352,35 @@ bool startKalmanFilters() {
     // Convert the received lines to polar form
     std::vector<CMU_EKF_Node::line_polar> polarLines {pointsToPolar(list)};
 
-    // Organize the lines into the rows
-    CMU_EKF_Node::lines_org organized {organizeLines(polarLines)};
+    double predictedRowDistances[4] {-ROW_SPACING * 2, -ROW_SPACING, ROW_SPACING, ROW_SPACING * 2};
 
+    // Organize the lines into the rows
+    CMU_EKF_Node::lines_org organized {organizeLines(polarLines, predictedRowDistances)};
 
     // For the initial state detection, all lines must be present. If they are not, wait for another reading:
     for (int i{0}; i < maxInitialStateDetections && 
-        ((MIDDLE_ROW && organized.center == NO_LINE()) || (organized.left == NO_LINE() || organized.right == NO_LINE())); i++) {
+        (organized.left == NO_LINE() || organized.right == NO_LINE()); i++) {
         list = ros::topic::waitForMessage<CMU_UNet_Node::line_list>(lineTopic);
         polarLines = pointsToPolar(list);
-        organized = organizeLines(polarLines);
+        organized = organizeLines(polarLines, predictedRowDistances);
     }
 
-    if ((MIDDLE_ROW && organized.center == NO_LINE()) || (organized.left == NO_LINE() || organized.right == NO_LINE())) {
+    if (organized.left == NO_LINE() || organized.right == NO_LINE()) {
         std::stringstream ss;
-        ss << "Tried " << maxInitialStateDetections << " times, but either the middle row is not present (if navigating with middle row)" <<
-        " or the left and right rows are not present (if there's no middle row). Aborting";
+        ss << "Tried " << maxInitialStateDetections << " times, but only " << ((organized.left == NO_LINE() && organized.right == NO_LINE()) ? 0 : 1) << 
+              " out of 2 required rows were detected.";
         ROS_INFO(ss.str().c_str());
         return false;
     }
     
-    ROS_INFO("Collected initial state detection");
+    if (VERBOSE) ROS_INFO("Collected initial state detection");
 
     // Initialize the Kalman Filters
-    Eigen::MatrixXd left(2, 1), center(2,1), right(2, 1);
+    Eigen::MatrixXd left(2, 1), right(2, 1);
     left << organized.left.distance, organized.left.theta;
-    center << organized.center.distance, organized.center.theta;
     right << organized.right.distance, organized.right.theta;
 
     std::cout << "Initial state left: " << left << std::endl;
-    std::cout << "Initial state center: " << center << std::endl;
     std::cout << "Initial state right: " << right << std::endl;
 
     // Gather the initial odometry
@@ -389,10 +389,9 @@ bool startKalmanFilters() {
     nav_msgs::Odometry::ConstPtr initialOdom {ros::topic::waitForMessage<nav_msgs::Odometry>(odomTopic)};
     odomCallback(initialOdom);
     
-    ROS_INFO("Gathered initial robot odometry");
+    if (VERBOSE) ROS_INFO("Gathered initial robot odometry");
 
     filterLeft = Kalman(left, initialCovariance, modelError, measurementError);
-    filterCenter = Kalman(center, initialCovariance, modelError, measurementError);
     filterRight = Kalman(right, initialCovariance, modelError, measurementError);
 
     lastYaw = yaw;
@@ -402,6 +401,8 @@ bool startKalmanFilters() {
     Tglobal_lastFrame << std::cos(-yaw), std::sin(-yaw), x,
                         -std::sin(-yaw), std::cos(-yaw), y,
                         0              , 0             , 1;
+
+    if (VERBOSE) ROS_INFO("Finished setting up Kalman filters");
 
     return true;
 }
